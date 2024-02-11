@@ -1,40 +1,19 @@
 import base64
-from datetime import datetime
-import json
 import logging
-import math
-from typing import Optional
 import os
-import pytz
 import sys
-import time
   
 import google.cloud.logging
 from google.cloud import storage
 import gradio as gr
 import PIL.Image
-from proto.marshal.collections import RepeatedComposite
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel, Part, GenerationConfig, GenerationResponse
-from moviepy.editor import VideoFileClip
   
   
 PROJECT_ID = os.environ.get("PROJECT_ID")
-if not PROJECT_ID:
-    raise ValueError("PROJECT_ID environment variable is not set.")
-  
 LOCATION = os.environ.get("LOCATION")
-if not LOCATION:
-    raise ValueError("LOCATION environment variable is not set.")
-  
 FILE_BUCKET_NAME = os.environ.get("FILE_BUCKET_NAME")
-if not FILE_BUCKET_NAME:
-    raise ValueError("FILE_BUCKET_NAME environment variable is not set.")
-  
-LOG_BUCKET_NAME = os.environ.get("LOG_BUCKET_NAME")
-if not LOG_BUCKET_NAME:
-    raise ValueError("LOG_BUCKET_NAME environment variable is not set.")  
-  
 SUPPORTED_IMAGE_EXTENSIONS = [
     "png",
     "jpeg",
@@ -51,40 +30,29 @@ SUPPORTED_VIDEO_EXTENSIONS = [
     "flv",
 ]
 ALL_SUPPORTED_EXTENSIONS = set(SUPPORTED_IMAGE_EXTENSIONS + SUPPORTED_VIDEO_EXTENSIONS)
-MAX_PROMPT_SIZE_MB = 4.0
+MAX_PROMPT_SIZE_MB = float(os.environ.get("MAX_PROMPT_SIZE_MB"))
   
-  
-# Cloud Logging ハンドラを logger に接続
+
+# 標準 Logger の設定
+logging.basicConfig(
+        format = "[%(asctime)s][%(levelname)s] %(message)s",
+        level = logging.DEBUG # ログレベルをデバックから取得するように設定
+    )
 logger = logging.getLogger()
+  
+
+# 各サービスの初期化
 try:
-    logging_client = google.cloud.logging.Client(project=PROJECT_ID)
+    logging_client = google.cloud.logging.Client()
     logging_client.setup_logging()
-except Exception as e:
-    logger.error(f"An error occurred during Cloud Logging initialization: {e}")
-  
-  
-# Vertex AI インスタンスの初期化
-try:
     vertexai.init(project=PROJECT_ID, location=LOCATION)
-except Exception as e:
-    logger.error(f"An error occurred during Vertex AI initialization: {e}")
-  
-  
-# Cloud Storage インスタンスの初期化
-try:
     storage_client = storage.Client(project=PROJECT_ID)
-except Exception as e:
-    logger.error(f"An error occurred during Cloud Storage initialization: {e}")
-  
-  
-# Gemini モデルの初期化
-try:
     txt_model = GenerativeModel("gemini-pro")
     multimodal_model = GenerativeModel("gemini-pro-vision")
 except Exception as e:
-    logger.error(f"An error occurred during GenerativeModel initialization: {e}")
+    logger.error(f"An error occurred during the initialization of one or more services: {e}")
   
-  
+
 # ファイルを Base64 にエンコード
 def file_to_base64(file_path: str) -> str:
     try:
@@ -123,7 +91,7 @@ def file_upload_gsc(file_bucket_name: str, source_file_path: str) -> str:
         logger.error(f"Error uploading to Cloud Storage: {e}")
   
   
-#  extension がサポートされているか判定
+# extension がサポートされているか判定
 def is_extension(extension: str) -> bool:
     return extension in ALL_SUPPORTED_EXTENSIONS
   
@@ -159,118 +127,7 @@ def calculate_prompt_size_mb(text: str, file_path: str) -> float:
   
     return prompt_size_mb
   
-    
-# safety_ratingsオブジェクトをリストに変換する
-def repeated_safety_ratings_to_list(safety_ratings: RepeatedComposite) -> list:
-    safety_rating_li = []
-    for safety_rating in safety_ratings:
-        safety_rating_dict = {}
-        safety_rating_dict["blocked"] = safety_rating.blocked
-        safety_rating_dict["category"] = safety_rating.category.name
-        safety_rating_dict["probability"] = safety_rating.probability.name
-        safety_rating_li.append(safety_rating_dict)
-    return safety_rating_li
-  
-# citation_metadataオブジェクトをリストに変換する
-def repeated_citations_to_list(citations: RepeatedComposite) -> list:
-    citation_li = []
-    for citation in citations:
-        citation_dict = {}
-        citation_dict["startIndex"] = citation.startIndex
-        citation_dict["endIndex"] = citation.endIndex
-        citation_dict["uri"] = citation.uri
-        citation_dict["title"] = citation.title
-        citation_dict["license"] = citation.license
-        citation_dict["publicationDate"] = citation.publicationDate
-        citation_li.append(citation_dict)
-    return citation_li
-  
-  
-# Gemini 利用ログの作成
-def create_gemini_usage_log(
-    current_time_str: str,
-    user_name: str,
-    temperature: float,
-    max_output_tokens: int,
-    top_k: int,
-    top_p: float, 
-    text: str,
-    response: GenerationResponse,
-    gcs_file_path: Optional[str] = None,
-    local_file_path: Optional[str] = None
-) -> json:
-  
-    # 初期値を設定
-    image_path, video_path, video_duration = None, None, 0
-  
-    # gcs_file_pathが提供された場合の処理
-    if gcs_file_path:
-  
-        # ファイルの拡張子を取得
-        file_extension = get_extension(gcs_file_path)
-        # 画像ファイルの場合
-        if file_extension in SUPPORTED_IMAGE_EXTENSIONS:
-            image_path = gcs_file_path
-  
-        # 動画ファイルの場合
-        elif file_extension in SUPPORTED_VIDEO_EXTENSIONS:
-            video_path = gcs_file_path
-            # 動画ファイルの場合は動画時間を取得
-            try:
-                with VideoFileClip(local_file_path) as video:
-                    video_duration = math.ceil(video.duration)
-            except Exception as e:
-                logger.error(f"An error occurred while calculating the video duration: {e}")
-                video_duration = 0
-    
-    gemini_usage_log = {
-        "current_time_str" : current_time_str,
-        "user" : user_name,
-        "prompt" : {
-            "text" : text,
-            "image_path" : image_path,
-            "video_path" : video_path,
-            "video_duration" :video_duration,
-            "config" : {
-                "temperature" : temperature,
-                "top_p" : top_p,
-                "top_k" : top_k,
-                "max_output_tokens" : max_output_tokens
-            },
-        },
-        "response" : {
-            "text" : response.candidates[0].text,
-            "finish_reason" : response.candidates[0].finish_reason.name,
-            "finish_message" : response.candidates[0].finish_message,
-            "safety_ratings" : repeated_safety_ratings_to_list(response.candidates[0].safety_ratings),
-            "citation_metadata" : repeated_citations_to_list(response.candidates[0].citation_metadata.citations)
-        },
-        "usage_metadata" : {
-            "prompt_token_count" : response._raw_response.usage_metadata.prompt_token_count,
-            "candidates_token_count" : response._raw_response.usage_metadata.candidates_token_count,
-            "total_token_count" : response._raw_response.usage_metadata.total_token_count
-        }
-    }
-  
-    gemini_usage_log_json = json.dumps(gemini_usage_log)
-    
-    return gemini_usage_log_json
-  
-  
-# ログデータを Cloud Storage にアップロード
-def log_upload_gcs(
-    log_bucket_name: str, 
-    current_time_str: str, 
-    user_name: str, 
-    log_data_json: json
-):
-    try:
-        bucket = storage_client.get_bucket(log_bucket_name)
-        blob = bucket.blob(f"output/{current_time_str}-{user_name}.json")
-        blob.upload_from_string(log_data_json)
-    except Exception as e:
-        logger.error(f"Error uploading to Cloud Storage: {e}")    
-  
+
 # ユーザーのクエリメッセージを作成
 def query_message(history: str, txt: str, image: str, video: str) -> str:
     try:
@@ -321,18 +178,8 @@ def gemini_response(
     max_output_tokens: int,
     top_k: int,
     top_p: float, 
-    request: gr.Request
 ) -> str:
     try:
-        # ログインしたユーザー情報を取得
-        user_email = request.headers.get('X-Goog-Authenticated-User-Email', 'Unknown')
-        user_name = user_email.split(':')[1].split('@')[0]
-  
-  
-        # 現在時刻を取得
-        jst = pytz.timezone('Asia/Tokyo')
-        current_time_str = datetime.now(jst).strftime("%Y%m%d-%H%M%S")
-  
         # テキストが未入力の場合
         if not text:
             response = "テキストを入力して下さい。"
@@ -349,26 +196,6 @@ def gemini_response(
                     top_k=top_k,
                     max_output_tokens=max_output_tokens
                 )
-            )
-  
-            # Gemini Pro 使用ログを作成
-            gemini_usage_log_json = create_gemini_usage_log(
-                current_time_str=current_time_str,
-                user_name=user_name,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                top_k=top_k,
-                top_p=top_p, 
-                text=text,
-                response=response,
-            )
-  
-            # データを Cloud Storage にアップロード
-            log_upload_gcs(
-                log_bucket_name=LOG_BUCKET_NAME, 
-                current_time_str=current_time_str, 
-                user_name=user_name, 
-                log_data_json=gemini_usage_log_json
             )
   
             history += [(None,response.text)]
@@ -415,28 +242,6 @@ def gemini_response(
                             top_k=top_k,
                             max_output_tokens=max_output_tokens
                         )
-                    )
-  
-                    # Gemini Pro Vision 使用ログを作成
-                    gemini_usage_log_json = create_gemini_usage_log(
-                        current_time_str=current_time_str,
-                        user_name=user_name,
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
-                        top_k=top_k,
-                        top_p=top_p, 
-                        text=text,
-                        response=response,
-                        gcs_file_path=gcs_url,
-                        local_file_path=file_path
-                    )
-  
-                    # データを Cloud Storage にアップロード
-                    log_upload_gcs(
-                        log_bucket_name=LOG_BUCKET_NAME, 
-                        current_time_str=current_time_str, 
-                        user_name=user_name, 
-                        log_data_json=gemini_usage_log_json
                     )
         
                     history += [(None,response.text)]
